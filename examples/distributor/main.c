@@ -566,6 +566,70 @@ print_stats(void)
 	}
 }
 
+static void
+encap_gse(struct rte_mbuf *m, unsigned dest_portid)
+{
+    struct rte_ether_hdr *eth;
+    void *tmp;
+
+    eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+    /* 02:00:00:00:00:xx */
+    tmp = &eth->d_addr.addr_bytes[0];
+    *((uint64_t *)tmp) = 0x000000000002 + ((uint64_t)dest_portid << 40);
+
+    /* src addr */
+    rte_ether_addr_copy(&l2fwd_ports_eth_addr[dest_portid], &eth->s_addr);
+}
+
+static void
+encap_bb(struct rte_mbuf *m, unsigned dest_portid)
+{
+    struct rte_mbuf *m, *prev;
+    uint32_t i, n, ofs, first_len;
+    uint32_t curr_idx = 0;
+
+    first_len = fp->frags[IP_FIRST_FRAG_IDX].len;
+    n = fp->last_idx - 1;
+
+    /*start from the last fragment. */
+    m = fp->frags[IP_LAST_FRAG_IDX].mb;
+    ofs = fp->frags[IP_LAST_FRAG_IDX].ofs;
+    curr_idx = IP_LAST_FRAG_IDX;
+
+    while (ofs != first_len) {
+
+        prev = m;
+
+        for (i = n; i != IP_FIRST_FRAG_IDX && ofs != first_len; i--) {
+
+            /* previous fragment found. */
+            if(fp->frags[i].ofs + fp->frags[i].len == ofs) {
+
+                RTE_ASSERT(curr_idx != i);
+
+                /* adjust start of the last fragment data. */
+                rte_pktmbuf_adj(m,
+                    (uint16_t)(m->l2_len + m->l3_len));
+                rte_pktmbuf_chain(fp->frags[i].mb, m);
+
+                /* this mbuf should not be accessed directly */
+                fp->frags[curr_idx].mb = NULL;
+                curr_idx = i;
+
+                /* update our last fragment and offset. */
+                m = fp->frags[i].mb;
+                ofs = fp->frags[i].ofs;
+            }
+        }
+
+        /* error - hole in the packet. */
+        if (m == prev) {
+            return NULL;
+        }
+    }
+}
+
 static int
 lcore_worker(struct lcore_params *p)
 {
@@ -588,6 +652,9 @@ lcore_worker(struct lcore_params *p)
 
 	printf("\nCore %u acting as worker core.\n", rte_lcore_id());
 	while (!quit_signal_work) {
+
+        nbclock_tx_before = rte_rdtsc();
+
 		num = rte_distributor_get_pkt(d, id, buf, buf, num);
 		/* Do a little bit of work for each packet */
 		for (i = 0; i < num; i++) {
@@ -596,7 +663,15 @@ lcore_worker(struct lcore_params *p)
 			while (rte_rdtsc() < t)
 				rte_pause();
 			buf[i]->port ^= xor_val;
-		}
+
+            if (encapsulate_gse)
+                encap_gse(buf[i])
+
+            if (encapsulate_bb)
+                encap_bb(buf[i])
+        }
+        nbclock_tx_after = rte_rdtsc();
+        nbclock_tx_diff = (nbclock_tx_after - nbclock_tx_before);
 
 		app_stats.worker_pkts[p->worker_id] += num;
 		if (num > 0)
